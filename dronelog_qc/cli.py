@@ -60,7 +60,12 @@ def main(argv=None):
     ap.add_argument("--yaw-b0", type=float, help="yaw ADRC b0 used on this flight")
     ap.add_argument("--mass", type=float, help="take-off mass kg")
     ap.add_argument("--gui", action="store_true", help="open the window instead")
+    ap.add_argument("--handbook", metavar="PDF", help="write the reference handbook PDF and exit")
     a = ap.parse_args(argv)
+    if a.handbook:
+        from .report.handbook import build_handbook
+        print(build_handbook(a.handbook, load_config(a.config)))
+        return 0
     if a.gui or not a.logs:
         from .gui import run_gui
         return run_gui()

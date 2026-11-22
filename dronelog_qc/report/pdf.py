@@ -17,6 +17,7 @@ from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph, Simpl
                                 Table, TableStyle)
 
 from .. import __version__
+from ..knowledge import ISSUES, POSTCRASH, PREFLIGHT, WHERE
 
 SEV_COLOR = {"BAD": colors.HexColor("#c62828"), "WARN": colors.HexColor("#ef6c00"),
              "INFO": colors.HexColor("#1565c0"), "OK": colors.HexColor("#2e7d32")}
@@ -292,6 +293,8 @@ def build_pdf(res, out_path, log_name=None):
         rows.append([f.severity, f.area, f.title + (f" (t={f.t:.1f}s)" if f.t is not None else ""), f.detail, f.confidence])
         extra.append(("TEXTCOLOR", (0, i), (0, i), SEV_COLOR.get(f.severity, colors.black)))
     el.append(_tbl(rows, [13, 17, 38, 100, 14], extra=extra))
+    el.extend(where_section(res))
+    el.extend(action_plan(res))
 
     # upset narrative
     if res.upset.get("t_start") is not None:
@@ -389,6 +392,13 @@ def build_pdf(res, out_path, log_name=None):
                         "verified physically (velocity = d(position)/dt, gyro = quaternion derivative, GPS vs position). "
                         "ADRC vector elements other than [5] and [6] are not identified yet.", SMALL))
 
+    el.append(PageBreak())
+    if res.upset.get("t_start") is not None or res.upset.get("t_impact"):
+        el.append(Paragraph("Post-crash procedure", H2))
+        el.append(_checklist(POSTCRASH))
+    el.append(Paragraph("Pre-flight checklist (before the next flight)", H2))
+    el.append(_checklist(PREFLIGHT))
+
     def _footer(canvas, doc_):
         canvas.saveState()
         canvas.setFont("Helvetica", 7)
@@ -441,3 +451,86 @@ def _upset_story(res):
                  "which points to a commanded attitude (outer loop / mode / RC input) or a control-software fault. "
                  "To prove it, the autopilot must also log the attitude setpoint and RC/mode state.")
     return "<br/>".join(parts)
+
+
+# ------------------------------------------------------------------ diagnosis
+SEV_RANK = {"BAD": 0, "WARN": 1, "INFO": 2, "OK": 3}
+
+
+def _issues_found(res):
+    """issue id -> (worst severity, [findings]) for WARN/BAD findings, ordered by severity."""
+    found = {}
+    for f in res.findings:
+        if not f.issue or f.issue not in ISSUES or f.severity not in ("BAD", "WARN", "INFO"):
+            continue
+        if f.severity == "INFO" and f.issue not in ("sluggish",):
+            continue
+        sev, lst = found.get(f.issue, ("INFO", []))
+        if SEV_RANK[f.severity] < SEV_RANK[sev]:
+            sev = f.severity
+        found[f.issue] = (sev, lst + [f])
+    return dict(sorted(found.items(), key=lambda kv: SEV_RANK[kv[1][0]]))
+
+
+def where_section(res):
+    found = _issues_found(res)
+    if not found:
+        return [Paragraph("Where is the problem?", H2), Paragraph("No issues that need action.", BODY)]
+    score = {}
+    for iid, (sev, _) in found.items():
+        for rank, (cause, where) in enumerate(ISSUES[iid]["causes"]):
+            w = (1.0 if sev == "BAD" else 0.6) / (rank + 1)
+            d = score.setdefault(where, [0.0, set()])
+            d[0] += w
+            d[1].add(ISSUES[iid]["title"])
+    rows = [["Look here", "What this area covers", "Related issues", "Weight"]]
+    for where, (w, titles) in sorted(score.items(), key=lambda kv: -kv[1][0]):
+        rows.append([where, WHERE[where], "; ".join(sorted(titles)), f"{w:.1f}"])
+    return [Paragraph("Where is the problem? (model / autopilot / GCS / outside)", H2),
+            Paragraph("Each detected issue votes for the areas its likely causes live in (most likely cause counts most). "
+                      "Start checking from the top row.", SMALL),
+            _tbl(rows, [22, 55, 90, 15])]
+
+
+def _checklist(items):
+    rows = [["[  ]", Paragraph(x, CELL)] for x in items]
+    t = Table([[Paragraph(a, CELL), b] for a, b in rows], colWidths=[10 * mm, 172 * mm])
+    t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+                           ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5)]))
+    return t
+
+
+def issue_card(iid, sev=None, evidence=None):
+    info = ISSUES[iid]
+    col = SEV_COLOR.get(sev or "INFO")
+    head = Table([[Paragraph(f"<font color='white'><b>{(sev + ' - ') if sev else ''}{info['title']}</b></font>", BODY)]],
+                 colWidths=[182 * mm])
+    head.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), col), ("TOPPADDING", (0, 0), (-1, -1), 3),
+                              ("BOTTOMPADDING", (0, 0), (-1, -1), 3)]))
+    parts = [head]
+    if evidence:
+        parts.append(Paragraph("<b>What the log shows:</b> " + " | ".join(evidence), BODY))
+    parts.append(Paragraph(f"<b>What it means:</b> {info['means']}", BODY))
+    parts.append(Paragraph(f"<b>How it is detected:</b> {info['detect']}", SMALL))
+    rows = [["#", "Likely cause (most likely first)", "Look at"]]
+    for i, (c, w) in enumerate(info["causes"], 1):
+        rows.append([str(i), c, w])
+    parts.append(_tbl(rows, [8, 150, 24]))
+    parts.append(Paragraph("<b>Check on the model (tick when done):</b>", BODY))
+    parts.append(_checklist(info["checks"]))
+    parts.append(Paragraph(f"<b>Fix:</b> {info['fix']}", BODY))
+    parts.append(Spacer(1, 6))
+    return KeepTogether(parts)
+
+
+def action_plan(res):
+    found = _issues_found(res)
+    if not found:
+        return []
+    el = [PageBreak(), Paragraph("Diagnosis & action plan", H2),
+          Paragraph("One card per detected issue, most serious first. Work through the checks in order - the cheapest "
+                    "and most likely items come first. Re-fly and re-run this tool after each fix.", SMALL)]
+    for iid, (sev, fs) in found.items():
+        ev = [f"{f.title}{f' (t={f.t:.1f}s)' if f.t is not None else ''}: {f.detail}" for f in fs[:2]]
+        el.append(issue_card(iid, sev, ev))
+    return el

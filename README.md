@@ -4,7 +4,17 @@ Drop a flight log in, get a **PDF QC report** + an **offline 3D replay**.
 Works fully offline. Built for the RFly autopilot (`.rlog`, viewed in the RflySim log replayer),
 also reads MAVLink `.tlog` (Mission Planner / QGC) and CSV exports.
 
+## Handbook
+`docs/DroneLogQC_Handbook.pdf` - the full reference: how to use the tool, what every log channel means,
+quad physics and motor patterns, ADRC b0 tuning (incl. starting a new model), crash investigation procedure,
+symptom -> where-to-look guide, the complete issue library, checklists, the sample crash, autopilot origin
+check. Rebuild with `python -m dronelog_qc --handbook docs/DroneLogQC_Handbook.pdf`.
+
 ## What the report tells you
+- **Where is the problem?** ranking: propulsion / GCS parameters / firmware / autopilot sensors / power /
+  outside / airframe.
+- **Diagnosis & action plan**: one card per detected issue - evidence, meaning, ranked causes with the area
+  to look at, tick-box physical checks, fix.
 - **QC verdict** (PASS / PASS WITH WARNINGS / FAIL) and every finding with evidence + confidence.
 - **Crash / upset reconstruction**: when control was lost, whether the controller fought it
   (motor split / saturation) or not, impact time and g-force, motors still running after the crash.
@@ -37,5 +47,13 @@ Settings (motor layout, PWM range, thresholds, tuning step sizes): `config/defau
 - `docs/AUTOPILOT_ORIGIN_CHECK.md` - what the log says about where the autopilot software comes from,
   and how to verify it.
 
+## Detected issues (all verified on simulated faults)
+Crash types: uncommanded upset, motor/prop failure (names the motor), power loss in air, collision, hard
+landing, no crash-disarm. Motors: single weak motor, CG offset, yaw/diagonal imbalance, saturation high/low,
+low thrust reserve, ESC desync, layout mismatch. Control: fast wobble, wobble only when braking, sluggish.
+Sensors: vibration (flight / ground idle), estimator mismatch, GPS glitch, weak GPS, hover drift, altitude
+hold. Environment: wind speed + direction. Power: low voltage, battery sag. Data: log gaps.
+
 ## Tests
-`python -W ignore tests/test_loaders.py`
+`python -W ignore tests/test_loaders.py` and `python tests/test_detection.py` (simulates 14 faults with
+`tools/simulate_rlog.py` and checks each is detected, and that a healthy flight gives no warnings).

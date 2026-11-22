@@ -25,6 +25,7 @@ class Finding:
     detail: str
     confidence: str = "high"
     t: Optional[float] = None
+    issue: Optional[str] = None      # key into knowledge.ISSUES
 
 
 @dataclass
@@ -66,10 +67,17 @@ def _runs(mask):
 
 
 def _highpass_rms(t, x, fc):
-    """RMS of x above cutoff fc (Hz) via moving-average subtraction."""
+    """RMS of x above cutoff fc (Hz). Butterworth if scipy is there, else moving-average subtraction."""
     if len(x) < 10:
         return float("nan")
     fs = 1.0 / np.median(np.diff(t))
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        if fc < fs / 2.2 and len(x) > 30:
+            sos = butter(4, fc, "highpass", fs=fs, output="sos")
+            return float(np.sqrt(np.mean(sosfiltfilt(sos, x - np.mean(x)) ** 2)))
+    except Exception:
+        pass
     n = max(3, int(fs / fc))
     return float(np.sqrt(np.mean((x - _smooth(x, n)) ** 2)))
 
@@ -118,8 +126,9 @@ def analyze(fd: FlightData, cfg: dict) -> Result:
     _vibration(res)
     _control(res)
     _attitude_consistency(res)
-    _wind(res)
     _power(res)
+    from . import diagnostics
+    diagnostics.run(res)
     _tuning_advice(res)
     order = {"BAD": 0, "WARN": 1, "INFO": 2, "OK": 3}
     res.findings.sort(key=lambda f: (order.get(f.severity, 9), f.t if f.t is not None else 0))
@@ -321,7 +330,7 @@ def _upset_and_impact(res):
                 "So the likely causes are: (1) the attitude was COMMANDED (outer loop / mode / RC input asked for it), "
                 "(2) the attitude estimate was wrong, or (3) a control-software fault. A prop/motor failure is LESS likely. "
                 "This log has no attitude-setpoint channel, so (1) cannot be confirmed - please log the attitude setpoint and RC input.",
-                "medium", t_start)
+                "medium", t_start, issue="upset_uncommanded")
     if up.get("first_saturation_t"):
         res.add("Crash", "WARN", "Motors saturated after the upset",
                 f"First motor at max at t={up['first_saturation_t']:.2f}s - the controller ran out of authority while recovering/falling.",
@@ -355,7 +364,7 @@ def _motors(res):
     air = g["_air"] > 0.5
     normal = air.copy()
     if res.upset.get("t_start") is not None:
-        normal &= t < res.upset["t_start"]
+        normal &= t < res.upset["t_start"] - 0.5      # keep the pre-upset disturbance out
     mo = res.motors
     mo["names"] = names
     mo["normal_window"] = (float(t[normal][0]), float(t[normal][-1])) if normal.any() else None
@@ -373,20 +382,8 @@ def _motors(res):
     mo["sat_high_pct"], mo["sat_low_pct"] = float(sat_hi), float(sat_lo)
     mo["noise_pwm"] = [float(_highpass_rms(t[normal], x, 2.0)) for x in Mn]
 
-    # verdicts
-    if thr > th["hover_throttle_high_pct"]:
-        res.add("Motors", "WARN", "High average throttle",
-                f"Average motor output {thr:.0f}% in normal flight - little reserve for wind/braking. Check weight, props, battery.")
-    else:
+    if thr <= th["hover_throttle_high_pct"]:
         res.add("Motors", "OK", "Throttle reserve", f"Average motor output {thr:.0f}% of range in normal flight.")
-    worst = int(np.argmax(np.abs(dev)))
-    sev = "BAD" if abs(dev[worst]) > th["motor_imbalance_bad_pct"] else "WARN" if abs(dev[worst]) > th["motor_imbalance_warn_pct"] else "OK"
-    res.add("Motors", sev, "Motor balance (normal flight)",
-            "Mean PWM: " + ", ".join(f"M{i + 1} {m:.0f}" for i, m in enumerate(mean)) +
-            f". Largest deviation M{worst + 1} {dev[worst]:+.1f}% of range.")
-    if sat_hi > th["saturation_warn_pct"]:
-        res.add("Motors", "BAD" if sat_hi > th["saturation_bad_pct"] else "WARN", "Motor saturation (max)",
-                f"At least one motor at max {sat_hi:.1f}% of normal flight time.")
 
     # layout-based torque split
     lay = af.get("motor_layout", {})
@@ -400,26 +397,9 @@ def _motors(res):
         lc = mo["layout_check"]
         if lc.get("verdict") == "mismatch":
             res.add("Motors", "WARN", "Motor layout in config does not match the physics in the log",
-                    lc["text"], lc.get("confidence", "medium"))
+                    lc["text"], lc.get("confidence", "medium"), issue="layout_mismatch")
         elif lc.get("verdict") == "ok":
             res.add("Motors", "OK", "Motor layout confirmed by physics", lc["text"])
-        # trim interpretation
-        for axis, val in (("roll", mo["roll_trim_pwm"]), ("pitch", mo["pitch_trim_pwm"])):
-            pct = 100 * val / (pmax - pmin)
-            if abs(pct) > 3:
-                side = {"roll": ("left", "right"), "pitch": ("front", "rear")}[axis]
-                heavy = side[0] if val > 0 else side[1]
-                res.add("Motors", "WARN" if abs(pct) > 6 else "INFO", f"Constant {axis} trim",
-                        f"{heavy.capitalize()} motors work {abs(pct):.1f}% harder on average -> CG offset to the {heavy}, "
-                        f"bent arm/motor mount, or steady wind during the flight.", "medium")
-    # diagonal (yaw) imbalance - layout independent for quad X: diagonals are M1/M3 and M2/M4
-    if len(names) == 4:
-        d = 100 * ((mean[0] + mean[2]) - (mean[1] + mean[3])) / 2 / (pmax - pmin)
-        mo["diag_imbalance_pct"] = float(d)
-        if abs(d) > 3:
-            res.add("Motors", "WARN", "Yaw (diagonal) imbalance",
-                    f"Diagonal pair M1+M3 vs M2+M4 differ by {d:+.1f}% -> twisted arm / tilted motor or a weak motor pair. "
-                    "Check motor mounts are perfectly vertical.", "medium")
 
 
 def _layout_check(res, names, rs, ps):
@@ -429,8 +409,10 @@ def _layout_check(res, names, rs, ps):
     tm, _ = fd.get(names[0])
     t0, t1 = res.motors["normal_window"]
     m = (tm >= t0) & (tm <= t1)
-    if res.upset.get("t_start") is not None:   # the dive itself is the most informative part
-        m |= (tm >= t0) & (tm <= res.upset["t_upset"] + 1.0)
+    up = res.upset
+    if up.get("t_start") is not None and not up.get("any_motor_at_max_during_dive"):
+        # the dive onset is the most informative part - unless a motor was saturated (then commands != thrust)
+        m |= (tm >= t0) & (tm <= up["t_upset"])
     if m.sum() < 40:
         return {"verdict": "unknown", "text": "too little flight data"}
     Mm = np.vstack([fd.get(n)[1][m] for n in names[:4]])
@@ -441,7 +423,7 @@ def _layout_check(res, names, rs, ps):
     for a in ("p", "q"):
         tt, v = fd.get(a)
         fs = 1 / np.median(np.diff(tt))
-        acc[a] = np.gradient(_smooth(v, int(fs / 20) + 1), tt)
+        acc[a] = np.gradient(_smooth(_smooth(v, int(fs / 10) + 1), int(fs / 10) + 1), tt)
     def corr(x, a):
         best = 0.0
         for lag in np.arange(0, 0.2, 0.025):
@@ -509,17 +491,18 @@ def _vibration(res):
             m = (tt >= a) & (tt <= b)
             if m.sum() < 50:
                 continue
-            out[ax] = {"hf_rms_dps": _highpass_rms(tt[m], x[m], 10.0), "peak_hz": _psd_peak(tt[m], x[m], 5.0)[0]}
+            out[ax] = {"hf_rms_dps": _highpass_rms(tt[m], x[m], 15.0), "peak_hz": _psd_peak(tt[m], x[m], 15.0)[0]}
         v[name] = out
         if out:
             worst = max(o["hf_rms_dps"] for o in out.values())
             sev = "BAD" if worst > th["gyro_noise_bad_dps"] else "WARN" if worst > th["gyro_noise_warn_dps"] else "OK"
             pk = max(out.values(), key=lambda o: o["hf_rms_dps"])["peak_hz"]
             res.add("Vibration", sev, f"Gyro noise ({name})",
-                    f"High-frequency (>10 Hz) gyro RMS: " + ", ".join(f"{k} {o['hf_rms_dps']:.1f}" for k, o in out.items()) +
+                    f"High-frequency (>15 Hz) gyro RMS: " + ", ".join(f"{k} {o['hf_rms_dps']:.1f}" for k, o in out.items()) +
                     f" deg/s; dominant frequency ~{pk:.0f} Hz. " +
                     ("High: balance props, check motor bearings, soften the autopilot damping mount, secure loose wires/arms."
-                     if sev != "OK" else "Fine."), "high")
+                     if sev != "OK" else "Fine."), "high",
+                    issue=None if sev == "OK" else ("vibration_ground" if name.startswith("ground") else "vibration"))
 
 
 # ---------------------------------------------------------------- control (ADRC)
@@ -592,41 +575,7 @@ def _attitude_consistency(res):
     else:
         res.add("Estimator", "WARN", "Tilt and acceleration disagree during the dive",
                 f"corr {c:.2f}: the logged attitude may be wrong (IMU/estimator fault) - check IMU calibration and vibration.",
-                "low", up["t_start"])
-
-
-# ---------------------------------------------------------------- wind
-def _wind(res):
-    """Steady-hover tilt -> wind estimate. Drone leans INTO the wind."""
-    fd, t, g = res.fd, res.grid_t, res.grid
-    if not ("roll" in g and "_hspeed" in g and fd.has("qw")):
-        return
-    air = g["_air"] > 0.5
-    steady = air & (g["_hspeed"] < 1.0) & (np.abs(g.get("vel_u", 0 * t)) < 0.4) & (g["_tilt"] < 25)
-    if res.upset.get("t_start") is not None:
-        steady &= t < res.upset["t_start"]
-    if steady.sum() < 100:
-        res.wind["note"] = "Not enough steady hover to estimate wind."
-        return
-    tt = t[steady]
-    R = _quat_R(fd, tt)
-    bz = -R[:, 2, :]
-    # horizontal thrust component per unit vertical thrust (bz[2] < 0 = up)
-    hn, he = np.mean(bz[0] / np.abs(bz[2])), np.mean(bz[1] / np.abs(bz[2]))
-    tilt = math.degrees(math.atan(math.hypot(hn, he)))
-    from_dir = (math.degrees(math.atan2(he, hn))) % 360   # thrust points upwind
-    mass = res.cfg["airframe"].get("mass_kg", 2.0)
-    cda = res.cfg["airframe"].get("cd_area_m2", 0.06)
-    v = math.sqrt(max(0.0, 2 * mass * G * math.hypot(hn, he) / (1.225 * cda)))
-    # yaw diversity tells if a constant body tilt (CG/IMU offset) can be separated
-    yaw_span = float(np.ptp(np.degrees(np.unwrap(np.radians(g["yaw"][steady])))))
-    res.wind.update({"tilt_deg": tilt, "from_deg": from_dir, "speed_ms_rough": v, "samples_s": steady.sum() / 50,
-                     "yaw_span_deg": yaw_span})
-    note = ("" if yaw_span > 90 else
-            " Heading barely changed while hovering, so a constant lean from CG offset / IMU mounting cannot be separated from wind.")
-    res.add("Wind", "INFO", "Wind estimate (from hover lean)",
-            f"Mean hover lean {tilt:.1f} deg towards {from_dir:.0f} deg (wind FROM ~{from_dir:.0f} deg), "
-            f"rough speed {v:.1f} m/s (assumes mass {mass} kg, drag area {cda} m^2).{note}", "low")
+                "low", up["t_start"], issue="estimator_mismatch")
 
 
 # ---------------------------------------------------------------- power
@@ -640,62 +589,66 @@ def _power(res):
     cells = res.cfg["airframe"].get("battery_cells") or int(round(p["v_start"] / 4.0))
     cells = max(1, cells)
     p["cells"] = cells
-    p["v_cell_min"] = p["v_min"] / cells
     p["t_v_min"] = float(t[np.argmin(v)])
+    t_up = res.upset.get("t_start")
+    vn = v[t < t_up] if t_up is not None and (t < t_up).sum() > 3 else v
+    p["v_min_normal"] = float(vn.min())
+    p["v_cell_min"] = p["v_min_normal"] / cells
     sev = "BAD" if p["v_cell_min"] < 3.3 else "WARN" if p["v_cell_min"] < 3.5 else "OK"
     res.add("Power", sev, "Battery voltage",
             f"{cells}S (guessed from voltage): start {p['v_start']:.2f} V ({p['v_start'] / cells:.2f} V/cell), "
-            f"min {p['v_min']:.2f} V ({p['v_cell_min']:.2f} V/cell at t={p['t_v_min']:.1f}s), end {p['v_end']:.2f} V.")
+            f"lowest in normal flight {p['v_min_normal']:.2f} V ({p['v_cell_min']:.2f} V/cell), end {p['v_end']:.2f} V.",
+            issue=None if sev == "OK" else "battery_low")
+    if t_up is not None and p["v_min"] < p["v_min_normal"] - 0.3:
+        res.add("Power", "INFO", "Voltage collapsed during the crash",
+                f"Down to {p['v_min']:.2f} V ({p['v_min'] / cells:.2f} V/cell) at t={p['t_v_min']:.1f}s while the motors ran at "
+                "full power after the upset - an effect of the crash, not its cause.", "high", p["t_v_min"])
 
 
 # ---------------------------------------------------------------- tuning advisor
 def _tuning_advice(res):
-    """Map symptoms to an ADRC b0 change of +/-0.25 or +/-0.5.
+    """Map wobble metrics to an ADRC b0 change of +/-0.25 or +/-0.5.
 
     ADRC: u = (u0 - z3) / b0. Larger |b0| -> smaller output -> softer.
-    So: too aggressive / oscillating -> INCREASE |b0|; sluggish -> DECREASE |b0|.
-    (Direction can be flipped in config: tuning.higher_b0_means = 'stiffer'.)
+    fast wobble in steady flight -> softer; slow swaying + overshoot -> stiffer.
+    Direction can be flipped in config: tuning.higher_b0_means = 'stiffer'.
     """
     c, cfg = res.control, res.cfg["tuning"]
+    wob = c.get("wobble", {})
     soft_dir = 1 if cfg.get("higher_b0_means", "softer") == "softer" else -1
     small, large = cfg["step_small"], cfg["step_large"]
-    vib = res.vibration.get("normal flight", {})
-    upset = bool(res.upset)
+    issues = {f.issue for f in res.findings if f.severity in ("WARN", "BAD")}
+    mech_first = bool(issues & {"vibration", "vibration_ground", "wobble_braking", "weak_motor", "motor_failure",
+                                "saturation_high", "thrust_reserve", "esc_desync"})
+    over = c.get("braking_overshoot_ms")
     for axis, key, cur_key, b0_key in (("Roll", "roll", "roll_pitch_b0", "rol_b0_est"),
                                        ("Pitch", "pitch", "roll_pitch_b0", "pit_b0_est"),
                                        ("Yaw", "yaw", "yaw_b0", "yaw_b0_est")):
-        osc = c.get(f"{key}_osc_rms_dps")
-        if osc is None:
+        o = wob.get(key)
+        if not o:
             continue
         cur = cfg.get(cur_key) if cfg.get(cur_key) is not None else c.get(b0_key)
-        f_pk = c.get(f"{key}_osc_peak_hz", float("nan"))
-        reasons = []
+        lim = 5.0 if key != "yaw" else 6.0
+        reasons = [f"fast wobble {o['fast_steady']:.1f} deg/s RMS (limit {lim:.0f})",
+                   f"slow sway {o['slow_steady']:.1f} deg/s RMS"]
         action, step = "keep", 0.0
-        # thresholds (deg/s RMS in 1-6 Hz band): yaw is allowed more
-        warn, bad = (6, 12) if key != "yaw" else (8, 16)
-        if osc > bad:
+        if o["fast_steady"] > 2 * lim:
             action, step = "softer", large
-            reasons.append(f"strong low-frequency wobble {osc:.1f} deg/s RMS at ~{f_pk:.1f} Hz")
-        elif osc > warn:
+        elif o["fast_steady"] > lim:
             action, step = "softer", small
-            reasons.append(f"noticeable wobble {osc:.1f} deg/s RMS at ~{f_pk:.1f} Hz")
-        else:
-            reasons.append(f"wobble {osc:.1f} deg/s RMS (fine)")
-        # sluggish: large slow excursions with no oscillation are hard to measure without setpoints
-        if action == "keep" and res.motors.get("sat_high_pct", 0) > 5:
-            reasons.append("motors often at max - fix thrust margin before tuning")
+        elif key != "yaw" and "sluggish" in issues | {f.issue for f in res.findings}:
+            action, step = "stiffer", small
+            reasons.append(f"overshoot after braking {over:.1f} m/s")
+        if mech_first and action != "keep":
+            reasons.append("fix the mechanical/propulsion findings first, then re-check")
         rec = None
-        if action != "keep":
+        if action != "keep" and cur is not None:
             sign = soft_dir if action == "softer" else -soft_dir
-            if cur is not None:
-                mag = abs(cur) + sign * step
-                rec = math.copysign(mag, cur)
-        res.tuning.append({
-            "axis": axis, "current_b0": cur, "action": action, "step": step,
-            "recommended_b0": rec, "reasons": reasons,
-            "confidence": "low" if upset else "medium",
-        })
-    if upset:
+            rec = math.copysign(abs(cur) + sign * step, cur)
+        res.tuning.append({"axis": axis, "current_b0": cur, "action": action, "step": step,
+                           "recommended_b0": rec, "reasons": reasons,
+                           "confidence": "low" if (res.upset or mech_first) else "medium"})
+    if res.upset:
         res.add("Tuning", "WARN", "Tuning advice is limited for this log",
                 "The flight ended in an upset/crash; tuning numbers use only the part before the upset. "
                 "Fix the root cause first, then tune with a clean hover + braking test flight.")
