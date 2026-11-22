@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+qc_reports/
+build/
+dist/
+*.spec
+samples/private/

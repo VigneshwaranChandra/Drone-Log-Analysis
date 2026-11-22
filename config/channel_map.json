@@ -1,0 +1,26 @@
+{
+  "_help": "CSV column name -> standard channel. Regex, case-insensitive, first match wins. ENU exports: x=East, y=North, z=Up.",
+  "time_pattern": "^(time|timestamp|t|time_s|time\\(s\\))\\b",
+  "angle_unit": "auto",
+  "channels": {
+    "roll":  ["^roll$", "attitudeangle.*(\\[0\\]|x|roll)"],
+    "pitch": ["^pitch$", "attitudeangle.*(\\[1\\]|y|pitch)"],
+    "yaw":   ["^yaw$", "^heading$", "attitudeangle.*(\\[2\\]|z|yaw)"],
+    "p": ["^p$", "rollrate", "angularrate.*(\\[0\\]|x)"],
+    "q": ["^q$", "pitchrate", "angularrate.*(\\[1\\]|y)"],
+    "r": ["^r$", "yawrate", "angularrate.*(\\[2\\]|z)"],
+    "motor_1": ["^motor_?1$", "dianji.*\\[0\\]", "^m1$"],
+    "motor_2": ["^motor_?2$", "dianji.*\\[1\\]", "^m2$"],
+    "motor_3": ["^motor_?3$", "dianji.*\\[2\\]", "^m3$"],
+    "motor_4": ["^motor_?4$", "dianji.*\\[3\\]", "^m4$"],
+    "vel_e": ["^vel_e$", "velocityenu.*(\\[0\\]|x)"],
+    "vel_n": ["^vel_n$", "velocityenu.*(\\[1\\]|y)"],
+    "vel_u": ["^vel_u$", "velocityenu.*(\\[2\\]|z)"],
+    "pos_e": ["^pos_e$", "positionenu.*(\\[0\\]|x)"],
+    "pos_n": ["^pos_n$", "positionenu.*(\\[1\\]|y)"],
+    "pos_u": ["^pos_u$", "positionenu.*(\\[2\\]|z)"],
+    "alt_rel": ["^alt(_rel)?$", "^altitude$"],
+    "volt": ["volt", "^v$", "currentsensor.*\\[0\\]"],
+    "curr": ["^curr", "amp", "currentsensor.*\\[1\\]"]
+  }
+}

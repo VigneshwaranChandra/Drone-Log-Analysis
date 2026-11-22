@@ -1,0 +1,40 @@
+{
+  "_help": "Edit these to match your airframe. All values are used by the analysis and the tuning advisor.",
+  "airframe": {
+    "name": "Quad X (reverse props)",
+    "mass_kg": 2.0,
+    "motor_layout": {
+      "_help": "Physical position of each motor index as logged (dianji[0] = motor_1). Confirmed by user: M1 front-right, M2 front-left, M3 rear-left, M4 rear-right.",
+      "motor_1": "front-right",
+      "motor_2": "front-left",
+      "motor_3": "rear-left",
+      "motor_4": "rear-right"
+    },
+    "pwm_min": 1000,
+    "pwm_idle": 1250,
+    "pwm_max": 1962,
+    "battery_cells": 0
+  },
+  "tuning": {
+    "_help": "ADRC b0 values used on THIS flight (from the GCS). Leave null if unknown; the tool then reads the value back from the log where possible.",
+    "roll_pitch_b0": null,
+    "yaw_b0": null,
+    "typical_roll_pitch_range": [7.5, 8.4],
+    "typical_yaw_range": [-1.4, -1.2],
+    "step_small": 0.25,
+    "step_large": 0.5,
+    "higher_b0_means": "softer",
+    "_higher_b0_means_help": "ADRC law u = (u0 - z3)/b0: a larger |b0| gives a smaller output -> softer. Confirm with one test flight: +0.25 should feel lazier."
+  },
+  "thresholds": {
+    "saturation_warn_pct": 2.0,
+    "saturation_bad_pct": 10.0,
+    "motor_imbalance_warn_pct": 5.0,
+    "motor_imbalance_bad_pct": 10.0,
+    "hover_throttle_high_pct": 65.0,
+    "gyro_noise_warn_dps": 8.0,
+    "gyro_noise_bad_dps": 15.0,
+    "crash_accel_ms2": 80.0,
+    "upset_angle_deg": 60.0
+  }
+}
